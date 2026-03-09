@@ -778,8 +778,8 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
 
   function toggleValgt(b){setValgte(p=>{const n=new Set(p);n.has(b)?n.delete(b):n.add(b);return n;});}
   function velgAlle(){
-    const alleValgt=filtrert.every(e=>valgte.has(e.beskrivelse));
-    setValgte(alleValgt?new Set():new Set(filtrert.map(e=>e.beskrivelse)));
+    const alleValgt=filtrertSortert.every(e=>valgte.has(e.beskrivelse));
+    setValgte(alleValgt?new Set():new Set(filtrertSortert.map(e=>e.beskrivelse)));
   }
   function sendEpost(){
     const ut=endringsliste.filter(e=>valgte.has(e.beskrivelse));
@@ -802,6 +802,22 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
   }
 
   const enhet=t=>t==="lengde"?"m":t==="areal"?"m²":"stk";
+
+  // Beregn prosent-endring for en rad basert på aktive vegkategorier
+  function beregnPst(e){
+    const foer=primærVerdi(e,"foer",aktiveVK);
+    const diff=primærVerdi(e,"diff",aktiveVK);
+    if(!foer||!diff||foer.sum===0) return null;
+    return Math.round((diff.sum/Math.abs(foer.sum))*1000)/10; // én desimal
+  }
+
+  // Sorter filtrert synkende på absolutt prosentendring
+  const filtrertSortert=[...filtrert].sort((a,b)=>{
+    const pa=beregnPst(a), pb=beregnPst(b);
+    const absA=pa!=null?Math.abs(pa):Math.abs(primærVerdi(a,"diff",aktiveVK)?.sum??0);
+    const absB=pb!=null?Math.abs(pb):Math.abs(primærVerdi(b,"diff",aktiveVK)?.sum??0);
+    return absB-absA;
+  });
 
   return (
     <div style={{maxWidth:1100,margin:"0 auto"}}>
@@ -959,27 +975,28 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                 <tr>
                   <th style={{width:40,padding:"4px 10px",borderBottom:`2px solid ${BORD}`}}>
                     <input type="checkbox"
-                      checked={filtrert.length>0&&filtrert.every(e=>valgte.has(e.beskrivelse))}
+                      checked={filtrertSortert.length>0&&filtrertSortert.every(e=>valgte.has(e.beskrivelse))}
                       onChange={velgAlle}
                       style={{cursor:"pointer",accentColor:IND,width:16,height:16}}/>
                   </th>
-                  {["Type","Beskrivelse","ID","Grunnlag","Nå","Differanse","Kart"].map(h=>(
+                  {["Type","Beskrivelse","ID","Grunnlag","Nå","Differanse","Endring %","Kart"].map(h=>(
                     <th key={h} style={{
                       padding:"6px 12px",fontFamily:FB,fontSize:"0.68rem",fontWeight:700,
                       color:MUTED,textTransform:"uppercase",letterSpacing:0.4,
                       borderBottom:`2px solid ${BORD}`,
-                      textAlign:["Grunnlag","Nå","Differanse"].includes(h)?"right":"left",
+                      textAlign:["Grunnlag","Nå","Differanse","Endring %"].includes(h)?"right":"left",
                       whiteSpace:"nowrap",
                     }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {filtrert.map((e,i)=>{
+                {filtrertSortert.map((e,i)=>{
                   const et=ET[e.endringstype];
                   const foer=primærVerdi(e,"foer",aktiveVK);
                   const naa=primærVerdi(e,"naa",aktiveVK);
                   const diff=primærVerdi(e,"diff",aktiveVK);
+                  const pst=beregnPst(e);
                   const apne=apneRad===e.beskrivelse;
                   const valgt=valgte.has(e.beskrivelse);
                   const rBg=valgt?"#f0fff8":apne?"#faf9ff":i%2===0?WHITE:"#fbfaff";
@@ -991,8 +1008,9 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                         outline:apne?`2px solid ${IND}44`:valgt?`1.5px solid ${GRN}55`:"none",
                         borderRadius:8}}>
                       <td style={{padding:"10px 10px",borderLeft:`4px solid ${et.color}`,borderRadius:"8px 0 0 8px"}}
-                        onClick={ev=>{ev.stopPropagation();toggleValgt(e.beskrivelse);}}>
-                        <input type="checkbox" checked={valgt} onChange={()=>toggleValgt(e.beskrivelse)}
+                        onClick={ev=>ev.stopPropagation()}>
+                        <input type="checkbox" checked={valgt}
+                          onChange={ev=>{ev.stopPropagation();toggleValgt(e.beskrivelse);}}
                           style={{cursor:"pointer",accentColor:GRN,width:16,height:16}}/>
                       </td>
                       <td style={{padding:"10px 12px"}}>
@@ -1023,6 +1041,23 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                           </span>
                         ):"—"}
                       </td>
+                      <td style={{padding:"10px 12px",textAlign:"right"}}>
+                        {pst!=null?(
+                          <span style={{
+                            display:"inline-block",
+                            background:pst>0?`${GRN}18`:pst<0?`${RED}18`:"#f4f2ff",
+                            color:pst>0?GRN:pst<0?RED:MUTED,
+                            border:`1.5px solid ${pst>0?`${GRN}44`:pst<0?`${RED}44`:BORD}`,
+                            borderRadius:20,padding:"3px 10px",
+                            fontFamily:FM,fontSize:"0.78rem",fontWeight:700,
+                            whiteSpace:"nowrap",
+                          }}>
+                            {pst>0?"+":""}{pst.toLocaleString("nb-NO")} %
+                          </span>
+                        ):(
+                          <span style={{fontFamily:FM,fontSize:"0.72rem",color:MUTED}}>ny/fjernet</span>
+                        )}
+                      </td>
                       <td style={{padding:"10px 12px",borderRadius:"0 8px 8px 0",textAlign:"center"}}>
                         {e.typeId&&(
                           <a href={`${VEGKART_BASE}${e.typeId}`} target="_blank" rel="noreferrer"
@@ -1040,7 +1075,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                     /* ── Detaljrad ── */
                     apne?(
                       <tr key={e.beskrivelse+"-exp"}>
-                        <td colSpan={8} style={{padding:"0 10px 10px 10px"}}>
+                        <td colSpan={9} style={{padding:"0 10px 10px 10px"}}>
                           <div className="anim-in" style={{background:"#faf9ff",
                             border:`1.5px solid ${BORD}`,borderRadius:14,
                             padding:"1.1rem 1.3rem"}}>
@@ -1104,7 +1139,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
             </table>
           </div>
 
-          {filtrert.length===0&&(
+          {filtrertSortert.length===0&&(
             <div style={{textAlign:"center",padding:"3rem",color:MUTED,fontFamily:FB}}>
               <div style={{fontSize:"2.8rem",marginBottom:"0.5rem"}}>🔍</div>
               Ingen endringer i denne kategorien
