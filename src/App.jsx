@@ -5,8 +5,141 @@ import * as XLSX from "xlsx";
    KONFIG
 ═══════════════════════════════════════════════════════════ */
 const NVDB_PORTAL  = "https://nvdb-vegnett-og-objektdata.atlas.vegvesen.no";
-const VEGKART_BASE = "https://vegkart.atlas.vegvesen.no/#vegobjekter/";
+const VEGKART_OBJ  = (objId, typeId) => `https://vegkart.atlas.vegvesen.no/#valgt:${objId}:${typeId}`;
+const VEGKART_TYPE = "https://vegkart.atlas.vegvesen.no/#vegobjekter/";
 const EPOST_TITTEL = "Endringer objekter V2-liste - utkast til gjennomgang byggemøte";
+
+/* ═══════════════════════════════════════════════════════════
+   V4 — PARSER OG DIFF
+═══════════════════════════════════════════════════════════ */
+function parseV4Xlsx(buffer) {
+  const wb = XLSX.read(buffer, {type:"array",cellDates:true});
+  const SKIP = ["Oversikt"];
+  const meta = {};
+  const objekttyper = [];
+
+  for (const arknavn of wb.SheetNames) {
+    if (SKIP.includes(arknavn)) continue;
+    const ws = wb.Sheets[arknavn];
+    const alle = XLSX.utils.sheet_to_json(ws, {header:1, defval:null});
+    if (!alle || alle.length < 9) continue;
+
+    // Meta fra rad 3-4 (første ark)
+    if (!meta.omrade) {
+      for (let i=0; i<8; i++) {
+        const s = String(alle[i]?.[0] ?? "");
+        if (s.startsWith("Område:")) meta.omrade = s.replace("Område:","").trim();
+        if (s.startsWith("Gyldighetsdato:")) {
+          const m1=s.match(/Gyldighetsdato:\s*(\S+)/), m2=s.match(/Utskriftsdato:\s*(\S+)/);
+          if(m1) meta.gyldighetsdato=m1[1].trim();
+          if(m2) meta.utskriftsdato=m2[1].trim();
+        }
+        if (s.startsWith("Rapporttype:")) meta.rapporttype=s.replace("Rapporttype:","").trim();
+      }
+    }
+
+    const headers = (alle[7]||[]).map(h=>h!=null?String(h).trim():null);
+    if (!headers[0] || !headers[0].startsWith("Objekt")) continue;
+
+    const objidIdx   = 0;
+    const vegkatIdx  = headers.indexOf("Vegkategori");
+    if (vegkatIdx === -1) continue;
+
+    // Finn beste mengdekolonne: Areal > Lengde > Lengde vegnett > Antall
+    let mengdeIdx=null, mengdeType=null, mengdeNavn=null;
+    for (const [navn,type] of [["Areal","areal"],["Lengde","lengde"],["Lengde vegnett","lengde"],["Antall","antall"]]) {
+      const idx = headers.lastIndexOf(navn);
+      if (idx !== -1) { mengdeIdx=idx; mengdeType=type; mengdeNavn=navn; break; }
+    }
+
+    const objekter = [];
+    for (let ri=8; ri<alle.length; ri++) {
+      const r = alle[ri];
+      if (!r || r[objidIdx]==null) continue;
+      const objId = String(r[objidIdx]).trim();
+      const vegkat = r[vegkatIdx] ? String(r[vegkatIdx]).trim() : "Ukjent";
+      const mengde = mengdeIdx!=null && r[mengdeIdx]!=null ? Number(r[mengdeIdx]) : null;
+      // Hent noen nøkkelattributter for "endret"-sammenligning
+      const attrs = {};
+      for (let ci=0; ci<Math.min(headers.length,30); ci++) {
+        if (headers[ci] && r[ci]!=null) attrs[headers[ci]] = r[ci];
+      }
+      objekter.push({objId, vegkat, mengde, mengdeType, attrs});
+    }
+
+    if (objekter.length > 0) {
+      // Kortere visningsnavn: "83 - Kum" → "Kum (83)"
+      const m = arknavn.match(/^(\d+)\s*-\s*(.+)$/);
+      const visning = m ? `${m[2].trim()} (${m[1]})` : arknavn;
+      objekttyper.push({arknavn, visning, mengdeNavn, mengdeType, objekter});
+    }
+  }
+
+  const antallObj = objekttyper.reduce((s,o)=>s+o.objekter.length, 0);
+  return { meta, objekttyper, antall: antallObj, filnavn:"" };
+}
+
+function kjorV4Diff(grunnlag, navaerende) {
+  const endringer = [];
+  // Bygg opp map: arknavn → {objId → obj}
+  const gMap = {};
+  for (const ot of grunnlag.objekttyper) {
+    gMap[ot.arknavn] = {};
+    for (const o of ot.objekter) gMap[ot.arknavn][o.objId] = o;
+  }
+  const nMap = {};
+  for (const ot of navaerende.objekttyper) {
+    nMap[ot.arknavn] = {};
+    for (const o of ot.objekter) nMap[ot.arknavn][o.objId] = o;
+  }
+
+  // Alle ark fra begge filer
+  const alleArk = new Set([
+    ...grunnlag.objekttyper.map(o=>o.arknavn),
+    ...navaerende.objekttyper.map(o=>o.arknavn),
+  ]);
+
+  for (const arknavn of alleArk) {
+    const gArk = gMap[arknavn] || {};
+    const nArk = nMap[arknavn] || {};
+    const m = arknavn.match(/^(\d+)\s*-\s*(.+)$/);
+    const visning = m ? `${m[2].trim()} (${m[1]})` : arknavn;
+    const objekttypeId = m ? m[1] : null;
+    const mengdeType = (grunnlag.objekttyper.find(o=>o.arknavn===arknavn) ||
+                        navaerende.objekttyper.find(o=>o.arknavn===arknavn))?.mengdeType || "lengde";
+
+    const alleIds = new Set([...Object.keys(gArk), ...Object.keys(nArk)]);
+    for (const objId of alleIds) {
+      const g = gArk[objId];
+      const n = nArk[objId];
+      let endringstype, mengdeFoer=null, mengdeNaa=null, diff=null;
+
+      if (!g && n)       { endringstype="tilgang"; mengdeNaa=n.mengde; diff=n.mengde; }
+      else if (g && !n)  { endringstype="avgang";  mengdeFoer=g.mengde; diff=g.mengde!=null?-g.mengde:null; }
+      else {
+        const mengdeDiff = (n.mengde??0) - (g.mengde??0);
+        if (Math.abs(mengdeDiff) > 0.001) {
+          endringstype="endret"; mengdeFoer=g.mengde; mengdeNaa=n.mengde; diff=mengdeDiff;
+        } else continue; // uendret
+      }
+
+      endringer.push({
+        objId, arknavn, visning, objekttypeId, endringstype,
+        vegkat: (n||g).vegkat,
+        mengdeFoer, mengdeNaa, diff, mengdeType,
+      });
+    }
+  }
+
+  // Oppsummering
+  const oppsummering = {
+    totaltTilgang: endringer.filter(e=>e.endringstype==="tilgang").length,
+    totaltAvgang:  endringer.filter(e=>e.endringstype==="avgang").length,
+    totaltEndret:  endringer.filter(e=>e.endringstype==="endret").length,
+  };
+
+  return { endringer, oppsummering };
+}
 
 /* ═══════════════════════════════════════════════════════════
    GLOBAL CSS  — Sora + JetBrains Mono, varm indigo + gul
@@ -296,16 +429,16 @@ function Konfetti() {
 /* ═══════════════════════════════════════════════════════════
    HP-BAR  (gamification: HP-stil fremgangsmåler)
 ═══════════════════════════════════════════════════════════ */
-function HPBar({steg}) {
-  const pct = Math.round((steg/4)*100);
-  const labels = ["Grunnlag","Nåværende","Bekreft","Ferdig!"];
-  const col = steg===4 ? GRN : steg>=3 ? AMB : IND;
+function HPBar({steg, total=4, labels}) {
+  const lbls = labels || ["Grunnlag","Nåværende","Bekreft","Ferdig!"];
+  const pct = Math.round((steg/total)*100);
+  const col = steg===total ? GRN : steg>=total-1 ? AMB : IND;
   return (
     <div style={{padding:"10px 24px", background:WHITE, borderBottom:`1.5px solid ${BORD}`,
       display:"flex", alignItems:"center", gap:"1rem"}}>
       <div style={{fontFamily:FB, fontSize:"0.7rem", fontWeight:700, color:MUTED,
         whiteSpace:"nowrap", minWidth:60}}>
-        {steg<4 ? `Steg ${steg}/4` : "✅ Ferdig!"}
+        {steg<total ? `Steg ${steg}/${total}` : "✅ Ferdig!"}
       </div>
       <div style={{flex:1, height:10, background:"#e8e4f8", borderRadius:6, overflow:"hidden", position:"relative"}}>
         <div style={{
@@ -319,7 +452,7 @@ function HPBar({steg}) {
         {pct}%
       </div>
       <div style={{display:"flex", gap:"0.5rem"}}>
-        {labels.map((l,i)=>{
+        {lbls.map((l,i)=>{
           const done=steg>i+1, curr=steg===i+1;
           return (
             <div key={i} style={{display:"flex",alignItems:"center",gap:"0.3rem",
@@ -341,12 +474,13 @@ function HPBar({steg}) {
 /* ═══════════════════════════════════════════════════════════
    TOPBAR
 ═══════════════════════════════════════════════════════════ */
-function Topbar({onHjelp}) {
+function Topbar({onHjelp, modus, onModus}) {
   return (
     <div style={{background:WHITE,borderBottom:`1.5px solid ${BORD}`,
       padding:"0 24px", height:58, display:"flex",alignItems:"center",
       boxShadow:"0 1px 0 rgba(91,69,214,0.06)"}}>
-      <div style={{display:"flex",alignItems:"center",gap:"0.7rem"}}>
+      <div style={{display:"flex",alignItems:"center",gap:"0.7rem",cursor:modus?"pointer":"default"}}
+        onClick={modus?onModus:undefined}>
         <div style={{width:36,height:36,borderRadius:10,
           background:`linear-gradient(135deg,${IND},${INDD})`,
           display:"flex",alignItems:"center",justifyContent:"center",
@@ -356,15 +490,22 @@ function Topbar({onHjelp}) {
             Endringsmelding
           </div>
           <div style={{fontFamily:FB,fontSize:"0.62rem",color:MUTED,fontWeight:500}}>
-            NVDB V2 · Kontraktsoppfølging
+            {modus==="v4"?"NVDB V4 · Objektdetaljer":modus==="v2"?"NVDB V2 · Kontraktsoppfølging":"NVDB · Kontraktsoppfølging"}
           </div>
         </div>
       </div>
-      <div style={{marginLeft:"auto"}}>
-        <button className="btn btn-ghost btn-sm" onClick={onHjelp}
-          style={{gap:"0.35rem"}}>
-          💡 <span>Hjelp</span>
-        </button>
+      <div style={{marginLeft:"auto",display:"flex",gap:"0.5rem",alignItems:"center"}}>
+        {modus&&(
+          <button className="btn btn-ghost btn-sm" onClick={onModus}>
+            ← Bytt modus
+          </button>
+        )}
+        {modus==="v2"&&(
+          <button className="btn btn-ghost btn-sm" onClick={onHjelp}
+            style={{gap:"0.35rem"}}>
+            💡 <span>Hjelp</span>
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1060,7 +1201,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                       </td>
                       <td style={{padding:"10px 12px",borderRadius:"0 8px 8px 0",textAlign:"center"}}>
                         {e.typeId&&(
-                          <a href={`${VEGKART_BASE}${e.typeId}`} target="_blank" rel="noreferrer"
+                          <a href={`${VEGKART_TYPE}${e.typeId}`} target="_blank" rel="noreferrer"
                             onClick={ev=>ev.stopPropagation()}
                             style={{fontFamily:FB,fontSize:"0.72rem",color:BLU,
                               textDecoration:"none",background:BLUL,
@@ -1166,6 +1307,323 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
 /* ═══════════════════════════════════════════════════════════
    HJELPEMODAL
 ═══════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════
+   V4 — DROPZONE (gjenbruker Dropzone, men med V4-parser)
+═══════════════════════════════════════════════════════════ */
+function V4FilSteg({nr, onNeste, onTilbake, forrigeInfo}) {
+  const [lastet, setLastet] = useState(null);
+  const [feil, setFeil]     = useState(null);
+  const [laster, setLaster] = useState(false);
+
+  async function behandleFil(fil) {
+    setFeil(null); setLaster(true);
+    try {
+      const buf = await fil.arrayBuffer();
+      const data = parseV4Xlsx(new Uint8Array(buf));
+      if (!data.objekttyper.length) throw new Error("Fant ingen V4-objektark i filen. Er dette en V4-rapport?");
+      data.filnavn = fil.name;
+      data.filKB   = Math.round(fil.size/1024);
+      setLastet(data);
+    } catch(e) {
+      setFeil(e.message||"Kunne ikke lese filen.");
+    } finally { setLaster(false); }
+  }
+
+  return (
+    <div className="anim-in" style={{maxWidth:640,margin:"0 auto"}}>
+      <div style={{textAlign:"center",marginBottom:"1.8rem"}}>
+        <div className="pop-in" style={{fontSize:"3.2rem",display:"inline-block",marginBottom:"0.4rem"}}>
+          {nr===1?"📋":"📊"}
+        </div>
+        <h2 style={{fontFamily:FB,fontWeight:800,fontSize:"1.5rem",color:INK,marginBottom:"0.3rem"}}>
+          {nr===1?"V4 Grunnlag":"V4 Nåværende"}
+        </h2>
+        <p style={{fontFamily:FB,fontSize:"0.84rem",color:SUB,lineHeight:1.6}}>
+          {nr===1
+            ?"Last opp V4-rapporten fra kontraktsdato (grunnlaget)"
+            :"Last opp V4-rapporten med dagens dato"}
+        </p>
+        {forrigeInfo&&(
+          <div style={{marginTop:"0.6rem",fontFamily:FB,fontSize:"0.76rem",
+            color:IND,background:INDL,border:`1px solid #c4b8f8`,
+            borderRadius:20,padding:"4px 14px",display:"inline-block"}}>
+            ✓ Grunnlag: {forrigeInfo}
+          </div>
+        )}
+      </div>
+      <div className="card" style={{padding:"1.8rem"}}>
+        <Dropzone onFil={behandleFil} laster={laster} lastet={lastet}
+          hint="V4 Detaljert mengdeoversikt (.xlsx)"/>
+        {lastet&&<FilMeta meta={lastet.meta} stempelet={nr===2}/>}
+        {lastet&&(
+          <div style={{marginTop:"0.8rem",fontFamily:FB,fontSize:"0.76rem",color:MUTED}}>
+            📂 {lastet.objekttyper.length} objekttyper · {lastet.antall.toLocaleString("nb-NO")} objekter totalt
+          </div>
+        )}
+        {feil&&(
+          <div className="anim-in" style={{marginTop:"0.7rem",background:REDL,
+            border:`1.5px solid #fca5a5`,borderRadius:12,
+            padding:"0.85rem 1rem",fontFamily:FB,fontSize:"0.8rem",color:RED}}>
+            ⚠️ {feil}
+          </div>
+        )}
+        <div style={{display:"flex",justifyContent:"space-between",marginTop:"1.4rem"}}>
+          <button className="btn btn-ghost btn-md" onClick={onTilbake}>← Tilbake</button>
+          <button className={`btn btn-lg ${lastet?"btn-primary":"btn-ghost"}`}
+            disabled={!lastet} onClick={()=>lastet&&onNeste(lastet)}>
+            {nr===1?"Neste: last opp nåværende →":"Kjør V4-analyse 🚀"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   V4 — RESULTATER
+═══════════════════════════════════════════════════════════ */
+function V4Resultater({data, grunnlag, navaerende, onNy}) {
+  const {endringer, oppsummering} = data;
+  const [typeFilter,  setTypeFilter]  = useState("alle");
+  const [etFilter,    setEtFilter]    = useState("alle");
+  const [vkFilter,    setVkFilter]    = useState(new Set());
+  const [konfetti,    setKonfetti]    = useState(true);
+
+  useEffect(()=>{const t=setTimeout(()=>setKonfetti(false),3500);return()=>clearTimeout(t);},[]);
+
+  // Unike verdier for filter
+  const alleTyper = [...new Set(endringer.map(e=>e.visning))].sort();
+  const alleVK    = [...new Set(endringer.map(e=>e.vegkat))].sort();
+
+  const aktiveVK  = vkFilter.size>0 ? [...vkFilter] : null;
+
+  const filtrert  = endringer.filter(e=>{
+    if (typeFilter!=="alle" && e.visning!==typeFilter) return false;
+    if (etFilter!=="alle"   && e.endringstype!==etFilter) return false;
+    if (aktiveVK && !aktiveVK.includes(e.vegkat)) return false;
+    return true;
+  });
+
+  // Sorter synkende på absolutt prosent endring
+  const sortert = [...filtrert].sort((a,b)=>{
+    const pstA = a.mengdeFoer ? Math.abs((a.diff??0)/Math.abs(a.mengdeFoer)*100) : Infinity;
+    const pstB = b.mengdeFoer ? Math.abs((b.diff??0)/Math.abs(b.mengdeFoer)*100) : Infinity;
+    if (pstB !== pstA) return pstB - pstA;
+    return Math.abs(b.diff??0) - Math.abs(a.diff??0);
+  });
+
+  const totalt = oppsummering.totaltTilgang + oppsummering.totaltAvgang + oppsummering.totaltEndret;
+  const enhet  = t=>t==="areal"?"m²":t==="antall"?"stk":"m";
+
+  return (
+    <div style={{maxWidth:1200,margin:"0 auto"}}>
+      {konfetti&&<Konfetti/>}
+
+      {/* Header */}
+      <div className="anim-in" style={{textAlign:"center",marginBottom:"1.8rem"}}>
+        <div className="stamp-in" style={{fontSize:"3.5rem",display:"inline-block",marginBottom:"0.4rem"}}>🗺️</div>
+        <h2 style={{fontFamily:FB,fontWeight:800,fontSize:"1.8rem",color:INK,
+          letterSpacing:-0.5,marginBottom:"0.4rem"}}>
+          V4-analyse ferdig!
+        </h2>
+        <p style={{fontFamily:FB,color:SUB,fontSize:"0.88rem",lineHeight:1.6}}>
+          {totalt===0
+            ?"Ingen endringer funnet mellom de to V4-rapportene 🎉"
+            :`Fant ${totalt} endrede objekter på tvers av ${alleTyper.length} objekttyper`}
+        </p>
+      </div>
+
+      {/* Score-kort */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:"0.9rem",marginBottom:"1.1rem"}}>
+        {[
+          {key:"endret",  n:oppsummering.totaltEndret,  ...ET.endret},
+          {key:"tilgang", n:oppsummering.totaltTilgang, ...ET.tilgang},
+          {key:"avgang",  n:oppsummering.totaltAvgang,  ...ET.avgang},
+        ].map((k,i)=>{
+          const aktiv=etFilter===k.key;
+          return(
+            <div key={k.key} className={`card card-lift anim-in anim-in-d${i}`}
+              onClick={()=>setEtFilter(aktiv?"alle":k.key)}
+              style={{padding:"1.2rem",textAlign:"center",cursor:"pointer",
+                background:aktiv?k.bg:WHITE,
+                border:`2px solid ${aktiv?k.color:BORD}`,
+                boxShadow:aktiv?`0 6px 22px ${k.color}30`:""}}>
+              <div style={{fontSize:"1.8rem",marginBottom:"0.2rem"}}>{k.emoji}</div>
+              <div style={{fontFamily:FM,fontSize:"2.2rem",fontWeight:600,color:k.color,lineHeight:1}}>{k.n}</div>
+              <div style={{fontFamily:FB,fontSize:"0.7rem",fontWeight:700,color:SUB,
+                marginTop:"0.2rem",textTransform:"uppercase",letterSpacing:0.5}}>{k.label}</div>
+              {aktiv&&<div style={{fontFamily:FB,fontSize:"0.65rem",color:k.color,marginTop:"0.2rem",fontWeight:600}}>↑ filtrert</div>}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Tabell */}
+      <div className="card anim-in" style={{padding:"1.4rem 1.6rem"}}>
+
+        {/* Filter — objekttype */}
+        <div style={{marginBottom:"0.8rem"}}>
+          <div style={{fontFamily:FB,fontSize:"0.72rem",fontWeight:700,color:MUTED,
+            textTransform:"uppercase",letterSpacing:0.5,marginBottom:"0.5rem"}}>
+            📂 Objekttype
+          </div>
+          <div style={{display:"flex",gap:"0.35rem",flexWrap:"wrap"}}>
+            <button className="btn btn-sm"
+              onClick={()=>setTypeFilter("alle")}
+              style={{background:typeFilter==="alle"?IND:"#f4f2ff",
+                color:typeFilter==="alle"?"#fff":SUB,
+                border:`1.5px solid ${typeFilter==="alle"?IND:BORD}`,
+                borderRadius:30,fontWeight:typeFilter==="alle"?700:500}}>
+              Alle ({endringer.length})
+            </button>
+            {alleTyper.map(t=>{
+              const antall=endringer.filter(e=>e.visning===t).length;
+              const aktiv=typeFilter===t;
+              return(
+                <button key={t} className="btn btn-sm"
+                  onClick={()=>setTypeFilter(aktiv?"alle":t)}
+                  style={{background:aktiv?IND:"#f4f2ff",color:aktiv?"#fff":SUB,
+                    border:`1.5px solid ${aktiv?IND:BORD}`,
+                    borderRadius:30,fontWeight:aktiv?700:500}}>
+                  {aktiv?"✓ ":""}{t} ({antall})
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Filter — vegkategori */}
+        {alleVK.length>1&&(
+          <div style={{marginBottom:"0.8rem",padding:"0.75rem 1rem",
+            background:"#faf9ff",border:`1.5px solid ${BORD}`,borderRadius:12,
+            display:"flex",gap:"0.5rem",alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontFamily:FB,fontSize:"0.72rem",fontWeight:700,color:MUTED}}>🛣 Vegkategori:</span>
+            {alleVK.map(vk=>{
+              const aktiv=vkFilter.has(vk);
+              return(
+                <button key={vk} className="btn btn-sm"
+                  onClick={()=>setVkFilter(prev=>{const n=new Set(prev);aktiv?n.delete(vk):n.add(vk);return n;})}
+                  style={{background:aktiv?IND:WHITE,color:aktiv?"#fff":SUB,
+                    border:`1.5px solid ${aktiv?IND:BORD}`,
+                    borderRadius:20,fontWeight:aktiv?700:500,
+                    boxShadow:aktiv?`0 2px 8px ${IND}33`:"none"}}>
+                  {aktiv?"✓ ":""}{vk}
+                </button>
+              );
+            })}
+            {vkFilter.size>0&&(
+              <button onClick={()=>setVkFilter(new Set())}
+                style={{background:"none",border:`1px solid ${BORD}`,borderRadius:20,
+                  padding:"5px 11px",fontFamily:FB,fontSize:"0.72rem",color:MUTED,cursor:"pointer"}}>
+                ✕ Nullstill
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Info-rad */}
+        <div style={{display:"flex",justifyContent:"space-between",
+          alignItems:"center",marginBottom:"0.8rem"}}>
+          <div style={{fontFamily:FB,fontSize:"0.78rem",color:SUB,fontWeight:600}}>
+            Viser {sortert.length} av {endringer.length} endringer
+          </div>
+          <button className="btn btn-ghost btn-sm" onClick={onNy}>↺ Ny analyse</button>
+        </div>
+
+        {/* Tabell */}
+        <div style={{overflowX:"auto"}}>
+          <table style={{width:"100%",borderCollapse:"separate",borderSpacing:"0 3px"}}>
+            <thead>
+              <tr>
+                {["Type","Objekt ID","Vegkat","Grunnlag","Nå","Diff","Endring %","Vegkart"].map(h=>(
+                  <th key={h} style={{padding:"6px 12px",fontFamily:FB,fontSize:"0.68rem",fontWeight:700,
+                    color:MUTED,textTransform:"uppercase",letterSpacing:0.4,
+                    borderBottom:`2px solid ${BORD}`,
+                    textAlign:["Grunnlag","Nå","Diff","Endring %"].includes(h)?"right":"left",
+                    whiteSpace:"nowrap"}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sortert.map((e,i)=>{
+                const et=ET[e.endringstype];
+                const pst = e.mengdeFoer && Math.abs(e.mengdeFoer)>0.001
+                  ? Math.round((e.diff/Math.abs(e.mengdeFoer))*1000)/10
+                  : null;
+                const rBg=i%2===0?WHITE:"#fbfaff";
+                const eu=enhet(e.mengdeType);
+                return(
+                  <tr key={`${e.arknavn}-${e.objId}`} style={{background:rBg}}>
+                    <td style={{padding:"9px 12px",borderLeft:`4px solid ${et.color}`,borderRadius:"8px 0 0 8px"}}>
+                      <span className="tag" style={{background:et.bg,color:et.color,
+                        border:`1px solid ${et.border}`,fontSize:"0.7rem"}}>
+                        {et.emoji} {et.label}
+                      </span>
+                    </td>
+                    <td style={{padding:"9px 12px",fontFamily:FM,fontSize:"0.78rem",color:INK,fontWeight:600}}>
+                      {e.objId}
+                    </td>
+                    <td style={{padding:"9px 12px"}}>
+                      <span style={{fontFamily:FB,fontSize:"0.72rem",fontWeight:700,
+                        background:INDL,color:IND,border:`1px solid #c4b8f8`,
+                        borderRadius:20,padding:"2px 9px"}}>
+                        {e.vegkat}
+                      </span>
+                    </td>
+                    <td style={{padding:"9px 12px",textAlign:"right",fontFamily:FM,fontSize:"0.78rem",color:RED}}>
+                      {e.mengdeFoer!=null?`${e.mengdeFoer.toLocaleString("nb-NO")} ${eu}`:"—"}
+                    </td>
+                    <td style={{padding:"9px 12px",textAlign:"right",fontFamily:FM,fontSize:"0.78rem",color:GRN}}>
+                      {e.mengdeNaa!=null?`${e.mengdeNaa.toLocaleString("nb-NO")} ${eu}`:"—"}
+                    </td>
+                    <td style={{padding:"9px 12px",textAlign:"right",fontFamily:FM,fontSize:"0.82rem",fontWeight:600}}>
+                      {e.diff!=null?(
+                        <span style={{color:e.diff>0?GRN:e.diff<0?RED:MUTED}}>
+                          {e.diff>0?"+":""}{e.diff.toLocaleString("nb-NO")} {eu}
+                        </span>
+                      ):"—"}
+                    </td>
+                    <td style={{padding:"9px 12px",textAlign:"right"}}>
+                      {pst!=null?(
+                        <span style={{display:"inline-block",
+                          background:pst>0?`${GRN}18`:pst<0?`${RED}18`:"#f4f2ff",
+                          color:pst>0?GRN:pst<0?RED:MUTED,
+                          border:`1.5px solid ${pst>0?`${GRN}44`:pst<0?`${RED}44`:BORD}`,
+                          borderRadius:20,padding:"3px 10px",
+                          fontFamily:FM,fontSize:"0.78rem",fontWeight:700}}>
+                          {pst>0?"+":""}{pst.toLocaleString("nb-NO")} %
+                        </span>
+                      ):(
+                        <span style={{fontFamily:FM,fontSize:"0.72rem",color:MUTED}}>ny/fjernet</span>
+                      )}
+                    </td>
+                    <td style={{padding:"9px 12px",borderRadius:"0 8px 8px 0",textAlign:"center"}}>
+                      <a href={VEGKART_OBJ(e.objId, e.objekttypeId)} target="_blank" rel="noreferrer"
+                        onClick={ev=>ev.stopPropagation()}
+                        style={{fontFamily:FB,fontSize:"0.72rem",color:BLU,
+                          textDecoration:"none",background:BLUL,
+                          border:`1px solid #bfdbfe`,borderRadius:20,
+                          padding:"4px 10px",whiteSpace:"nowrap",display:"inline-block"}}>
+                        🗺 Kart
+                      </a>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {sortert.length===0&&(
+            <div style={{textAlign:"center",padding:"2.5rem",fontFamily:FB,color:MUTED}}>
+              Ingen endringer matcher valgte filtre
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
 const GUIDE = [
   {nr:"01",tittel:"Last ned grunnlagsfil",ikon:"📥",col:AMB,steg:[
     {t:"Gå til NVDB-portalen",d:"Åpne nvdb-vegnett-og-objektdata.atlas.vegvesen.no i nettleseren."},
@@ -1306,57 +1764,165 @@ function HjelpeModal({onLukk}) {
 }
 
 /* ═══════════════════════════════════════════════════════════
+   MODUSVELGER
+═══════════════════════════════════════════════════════════ */
+function Modusvelger({onVelg}) {
+  return (
+    <div className="anim-in" style={{maxWidth:640,margin:"4rem auto 0",padding:"0 1rem"}}>
+      <div style={{textAlign:"center",marginBottom:"2.5rem"}}>
+        <div style={{fontSize:"3.5rem",marginBottom:"0.6rem"}}>🛣️</div>
+        <h1 style={{fontFamily:FB,fontWeight:800,fontSize:"1.9rem",color:INK,
+          letterSpacing:-0.5,marginBottom:"0.5rem"}}>
+          Endringsmelding-Appen
+        </h1>
+        <p style={{fontFamily:FB,fontSize:"0.9rem",color:SUB,lineHeight:1.7}}>
+          Velg hvilken rapporttype du vil analysere
+        </p>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"1.2rem"}}>
+        {/* V2 */}
+        <div className="card card-lift" onClick={()=>onVelg("v2")}
+          style={{padding:"2rem 1.5rem",textAlign:"center",cursor:"pointer",
+            border:`2px solid ${BORD}`,transition:"all 0.18s"}}
+          onMouseEnter={e=>{e.currentTarget.style.borderColor=IND;e.currentTarget.style.boxShadow=`0 8px 28px ${IND}22`;}}
+          onMouseLeave={e=>{e.currentTarget.style.borderColor=BORD;e.currentTarget.style.boxShadow="";}}>
+          <div style={{fontSize:"2.8rem",marginBottom:"0.8rem"}}>📊</div>
+          <div style={{fontFamily:FB,fontWeight:800,fontSize:"1.1rem",color:INK,marginBottom:"0.4rem"}}>
+            V2-analyse
+          </div>
+          <div style={{fontFamily:FB,fontSize:"0.78rem",color:SUB,lineHeight:1.6}}>
+            Aggregert mengdeoversikt per vegkategori. Sammenlign to V2-rapporter og finn endringer.
+          </div>
+          <div style={{marginTop:"1rem"}}>
+            <span style={{fontFamily:FB,fontSize:"0.7rem",fontWeight:600,
+              background:INDL,color:IND,border:`1px solid #c4b8f8`,
+              borderRadius:20,padding:"3px 12px"}}>
+              Oversiktsnivå
+            </span>
+          </div>
+        </div>
+
+        {/* V4 */}
+        <div className="card card-lift" onClick={()=>onVelg("v4")}
+          style={{padding:"2rem 1.5rem",textAlign:"center",cursor:"pointer",
+            border:`2px solid ${BORD}`,transition:"all 0.18s"}}
+          onMouseEnter={e=>{e.currentTarget.style.borderColor=GRN;e.currentTarget.style.boxShadow=`0 8px 28px ${GRN}22`;}}
+          onMouseLeave={e=>{e.currentTarget.style.borderColor=BORD;e.currentTarget.style.boxShadow="";}}>
+          <div style={{fontSize:"2.8rem",marginBottom:"0.8rem"}}>🗺️</div>
+          <div style={{fontFamily:FB,fontWeight:800,fontSize:"1.1rem",color:INK,marginBottom:"0.4rem"}}>
+            V4-analyse
+          </div>
+          <div style={{fontFamily:FB,fontSize:"0.78rem",color:SUB,lineHeight:1.6}}>
+            Detaljert per objekt. Se hvert enkelt endret objekt med direktelenke til Vegkart.
+          </div>
+          <div style={{marginTop:"1rem"}}>
+            <span style={{fontFamily:FB,fontSize:"0.7rem",fontWeight:600,
+              background:`${GRN}15`,color:GRN,border:`1px solid ${GRN}44`,
+              borderRadius:20,padding:"3px 12px"}}>
+              Objektnivå + Kart
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style={{textAlign:"center",marginTop:"1.5rem",fontFamily:FB,
+        fontSize:"0.74rem",color:MUTED}}>
+        Tips: Bruk V2 for oversikten, deretter V4 for å se detaljene i kartet
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
    HOVED-APP
 ═══════════════════════════════════════════════════════════ */
 export default function App() {
+  const [modus,setModus]         = useState(null); // null | "v2" | "v4"
   const [steg,setSteg]           = useState(1);
   const [grunnlag,setGrunnlag]   = useState(null);
   const [nav,setNav]             = useState(null);
   const [res,setRes]             = useState(null);
   const [hjelp,setHjelp]         = useState(true);
 
-  function reset(){setSteg(1);setGrunnlag(null);setNav(null);setRes(null);}
+  // V4-tilstand
+  const [v4Grunnlag,setV4Grunnlag] = useState(null);
+  const [v4Nav,setV4Nav]           = useState(null);
+  const [v4Res,setV4Res]           = useState(null);
+  const [v4Steg,setV4Steg]         = useState(1);
+
+  function reset(){
+    setModus(null);
+    setSteg(1);setGrunnlag(null);setNav(null);setRes(null);
+    setV4Steg(1);setV4Grunnlag(null);setV4Nav(null);setV4Res(null);
+    setHjelp(false);
+  }
 
   return (
     <div style={{minHeight:"100vh",background:BG,display:"flex",
       flexDirection:"column",fontFamily:FB}}>
       <style>{CSS}</style>
-      {hjelp&&<HjelpeModal onLukk={()=>setHjelp(false)}/>}
+      {hjelp&&modus==="v2"&&<HjelpeModal onLukk={()=>setHjelp(false)}/>}
 
-      <Topbar onHjelp={()=>setHjelp(true)}/>
-      <HPBar steg={steg}/>
+      <Topbar onHjelp={()=>modus==="v2"&&setHjelp(true)} modus={modus} onModus={reset}/>
+
+      {modus==="v2"&&<HPBar steg={steg}/>}
+      {modus==="v4"&&<HPBar steg={v4Steg} total={3} labels={["V4 Grunnlag","V4 Nåværende","Ferdig!"]}/>}
 
       <div style={{flex:1,padding:"2.2rem 1.5rem",
         maxWidth:1200,margin:"0 auto",width:"100%"}}>
-        {steg===1&&(
-          <FilSteg nr={1}
-            onNeste={d=>{setGrunnlag(d);setSteg(2);}}/>
+
+        {/* MODUSVELGER */}
+        {!modus&&<Modusvelger onVelg={m=>{setModus(m);setHjelp(m==="v2");}}/>}
+
+        {/* V2-FLYT */}
+        {modus==="v2"&&steg===1&&(
+          <FilSteg nr={1} onNeste={d=>{setGrunnlag(d);setSteg(2);}}/>
         )}
-        {steg===2&&(
+        {modus==="v2"&&steg===2&&(
           <FilSteg nr={2}
-            forrigeInfo={
-              grunnlag?.meta?.omrade
-                ?`${grunnlag.meta.omrade}${grunnlag.meta.gyldighetsdato?" · "+grunnlag.meta.gyldighetsdato:""}`
-                :grunnlag?.filnavn
-            }
+            forrigeInfo={grunnlag?.meta?.omrade
+              ?`${grunnlag.meta.omrade}${grunnlag.meta.gyldighetsdato?" · "+grunnlag.meta.gyldighetsdato:""}`
+              :grunnlag?.filnavn}
             onNeste={d=>{setNav(d);setSteg(3);}}
             onTilbake={()=>setSteg(1)}/>
         )}
-        {steg===3&&grunnlag&&nav&&(
+        {modus==="v2"&&steg===3&&grunnlag&&nav&&(
           <Steg3 grunnlag={grunnlag} navaerende={nav}
             onResultat={r=>{setRes(r);setSteg(4);}}
             onTilbake={()=>setSteg(2)}/>
         )}
-        {steg===4&&res&&(
-          <Resultater data={res} grunnlag={grunnlag}
-            navaerende={nav} onNy={reset}/>
+        {modus==="v2"&&steg===4&&res&&(
+          <Resultater data={res} grunnlag={grunnlag} navaerende={nav} onNy={reset}/>
+        )}
+
+        {/* V4-FLYT */}
+        {modus==="v4"&&v4Steg===1&&(
+          <V4FilSteg nr={1}
+            onNeste={d=>{setV4Grunnlag(d);setV4Steg(2);}}
+            onTilbake={reset}/>
+        )}
+        {modus==="v4"&&v4Steg===2&&(
+          <V4FilSteg nr={2}
+            forrigeInfo={v4Grunnlag?.meta?.omrade
+              ?`${v4Grunnlag.meta.omrade}${v4Grunnlag.meta.gyldighetsdato?" · "+v4Grunnlag.meta.gyldighetsdato:""}`
+              :v4Grunnlag?.filnavn}
+            onNeste={d=>{
+              setV4Nav(d);
+              setV4Res(kjorV4Diff(v4Grunnlag,d));
+              setV4Steg(3);
+            }}
+            onTilbake={()=>setV4Steg(1)}/>
+        )}
+        {modus==="v4"&&v4Steg===3&&v4Res&&(
+          <V4Resultater data={v4Res} grunnlag={v4Grunnlag} navaerende={v4Nav} onNy={reset}/>
         )}
       </div>
 
       <div style={{background:WHITE,borderTop:`1.5px solid ${BORD}`,
         padding:"0.7rem 1.8rem",display:"flex",justifyContent:"space-between"}}>
         <span style={{fontFamily:FB,fontSize:"0.7rem",color:MUTED}}>
-          Endringsmelding-Appen · NVDB V2 Aggregert
+          Endringsmelding-Appen · NVDB {modus==="v4"?"V4 Detaljert":"V2 Aggregert"}
         </span>
         <a href={NVDB_PORTAL} target="_blank" rel="noreferrer"
           style={{fontFamily:FB,fontSize:"0.7rem",color:IND,textDecoration:"none",fontWeight:600}}>
