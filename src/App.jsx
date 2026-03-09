@@ -252,11 +252,12 @@ function lastNed(innhold,filnavn,mime){
   a.href=URL.createObjectURL(new Blob(["\uFEFF"+innhold],{type:mime}));
   a.download=filnavn; a.click(); URL.revokeObjectURL(a.href);
 }
-function primærVerdi(e,side){
+function primærVerdi(e,side,aktiveVK=null){
   const verdier=side==="foer"?e.verdierFoer:side==="naa"?e.verdierNaa:null;
+  const vkListe=aktiveVK&&aktiveVK.length>0 ? aktiveVK : (e.vegkategorier||[]);
   for(const t of["lengde","areal","antall"]){
     let s=0,h=false;
-    for(const vk of(e.vegkategorier||[])){
+    for(const vk of vkListe){
       const v=side==="diff"?e.diff?.[vk]?.[t]:verdier?.[vk]?.[t];
       if(v!=null){s+=v;h=true;}
     }
@@ -739,6 +740,7 @@ function XPBanner({totalt}) {
 ═══════════════════════════════════════════════════════════ */
 function Resultater({data,grunnlag,navaerende,onNy}) {
   const [filter,setFilter]=useState("alle");
+  const [vegkatFilter,setVegkatFilter]=useState(new Set()); // tomt = alle
   const [apneRad,setApneRad]=useState(null);
   const [valgte,setValgte]=useState(new Set());
   const [konfetti,setKonfetti]=useState(true);
@@ -747,7 +749,31 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
   useEffect(()=>{const t=setTimeout(()=>setKonfetti(false),3500);return()=>clearTimeout(t);},[]);
 
   const {oppsummering,endringsliste,vegkategorier}=data;
-  const filtrert=filter==="alle"?endringsliste:endringsliste.filter(e=>e.endringstype===filter);
+
+  // Aktive vegkategorier (tom = alle)
+  const aktiveVK = vegkatFilter.size>0 ? [...vegkatFilter] : null;
+
+  function toggleVegkat(vk){
+    setVegkatFilter(prev=>{
+      const n=new Set(prev);
+      n.has(vk)?n.delete(vk):n.add(vk);
+      return n;
+    });
+    setApneRad(null); // lukk åpne detaljer ved filterbytte
+  }
+
+  const filtrert=endringsliste.filter(e=>{
+    if(filter!=="alle" && e.endringstype!==filter) return false;
+    if(aktiveVK){
+      // Behold rader som har endring i minst én av de valgte vegkategoriene
+      const harEndring=aktiveVK.some(vk=>{
+        const dv=e.diff?.[vk];
+        return dv && Object.values(dv).some(v=>v!=null&&Math.abs(v)>0.001);
+      });
+      if(!harEndring) return false;
+    }
+    return true;
+  });
   const totalt=oppsummering.totaltEndret+oppsummering.totaltTilgang+oppsummering.totaltAvgang;
 
   function toggleValgt(b){setValgte(p=>{const n=new Set(p);n.has(b)?n.delete(b):n.add(b);return n;});}
@@ -760,7 +786,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
     if(!ut.length) return;
     lastNed(lagCSV(ut,vegkategorier),`endringsmelding_${dato}.csv`,"text/csv;charset=utf-8");
     const lin=ut.map(e=>{
-      const d=primærVerdi(e,"diff");
+      const d=primærVerdi(e,"diff",aktiveVK);
       const ds=d?`${d.sum>0?"+":""}${d.sum.toLocaleString("nb-NO")} ${d.type==="lengde"?"m":d.type==="areal"?"m²":"stk"}`:"";
       return `  ${ET[e.endringstype].emoji} ${e.beskrivelse}  ${ds}`.trimEnd();
     });
@@ -864,7 +890,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
           {/* Filter-piller */}
           <div style={{display:"flex",gap:"0.4rem",marginBottom:"1rem",
             flexWrap:"wrap",alignItems:"center",justifyContent:"space-between"}}>
-            <div style={{display:"flex",gap:"0.4rem",flexWrap:"wrap"}}>
+            <div style={{display:"flex",gap:"0.4rem",flexWrap:"wrap",alignItems:"center"}}>
               {[
                 {k:"alle",    l:`Alle (${endringsliste.length})`},
                 {k:"endret",  l:`🔄 Endret (${oppsummering.totaltEndret})`},
@@ -887,6 +913,44 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
             <div style={{fontFamily:FB,fontSize:"0.72rem",color:MUTED}}>
               💡 Klikk en rad for detaljer
             </div>
+          </div>
+
+          {/* Vegkategori flervalg */}
+          <div style={{marginBottom:"1rem",padding:"0.85rem 1rem",
+            background:"#faf9ff",border:`1.5px solid ${BORD}`,borderRadius:14,
+            display:"flex",gap:"0.6rem",alignItems:"center",flexWrap:"wrap"}}>
+            <span style={{fontFamily:FB,fontSize:"0.72rem",fontWeight:700,
+              color:MUTED,whiteSpace:"nowrap"}}>🛣 Vegkategori:</span>
+            {vegkategorier.map(vk=>{
+              const aktiv=vegkatFilter.has(vk);
+              return(
+                <button key={vk} className="btn btn-sm"
+                  onClick={()=>toggleVegkat(vk)}
+                  style={{
+                    background:aktiv?IND:WHITE,
+                    color:aktiv?"#fff":SUB,
+                    border:`1.5px solid ${aktiv?IND:BORD}`,
+                    borderRadius:20,fontWeight:aktiv?700:500,
+                    padding:"5px 13px",transition:"all 0.15s",
+                    boxShadow:aktiv?`0 2px 8px ${IND}33`:"none",
+                  }}>
+                  {aktiv?"✓ ":""}{vk}
+                </button>
+              );
+            })}
+            {vegkatFilter.size>0&&(
+              <button onClick={()=>setVegkatFilter(new Set())}
+                style={{background:"none",border:`1px solid ${BORD}`,borderRadius:20,
+                  padding:"5px 11px",fontFamily:FB,fontSize:"0.72rem",
+                  color:MUTED,cursor:"pointer",transition:"all 0.15s"}}>
+                ✕ Nullstill
+              </button>
+            )}
+            {vegkatFilter.size>0&&(
+              <span style={{fontFamily:FB,fontSize:"0.72rem",color:IND,fontWeight:600,marginLeft:"0.2rem"}}>
+                — tall og summer viser kun valgte kategorier
+              </span>
+            )}
           </div>
 
           <div style={{overflowX:"auto"}}>
@@ -913,9 +977,9 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
               <tbody>
                 {filtrert.map((e,i)=>{
                   const et=ET[e.endringstype];
-                  const foer=primærVerdi(e,"foer");
-                  const naa=primærVerdi(e,"naa");
-                  const diff=primærVerdi(e,"diff");
+                  const foer=primærVerdi(e,"foer",aktiveVK);
+                  const naa=primærVerdi(e,"naa",aktiveVK);
+                  const diff=primærVerdi(e,"diff",aktiveVK);
                   const apne=apneRad===e.beskrivelse;
                   const valgt=valgte.has(e.beskrivelse);
                   const rBg=valgt?"#f0fff8":apne?"#faf9ff":i%2===0?WHITE:"#fbfaff";
@@ -999,7 +1063,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                                   </tr>
                                 </thead>
                                 <tbody>
-                                  {(e.vegkategorier||[]).map((vk,vi)=>{
+                                  {(aktiveVK || e.vegkategorier||[]).map((vk,vi)=>{
                                     const fV=e.verdierFoer?.[vk]??{},nV=e.verdierNaa?.[vk]??{},dV=e.diff?.[vk]??{};
                                     const harNoe=["antall","lengde","areal"].some(t=>fV[t]!=null||nV[t]!=null||dV[t]);
                                     if(!harNoe) return null;
