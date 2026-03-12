@@ -357,7 +357,11 @@ function kjorDiff(nav, grunn) {
       const vA=a?.[vk]??{},vB=b?.[vk]??{};
       const typer=new Set([...Object.keys(vA),...Object.keys(vB)]);
       d[vk]={};
-      for(const t of typer) d[vk][t]=Math.round(((vA[t]??0)-(vB[t]??0))*100)/100;
+      for(const t of typer){
+        // Sett null hvis begge sider mangler data for denne typen
+        if(vA[t]==null && vB[t]==null){ d[vk][t]=null; continue; }
+        d[vk][t]=Math.round(((vA[t]??0)-(vB[t]??0))*100)/100;
+      }
     }
     return d;
   };
@@ -365,7 +369,7 @@ function kjorDiff(nav, grunn) {
   for(const [besk,a] of mapA) if(!mapB.has(besk)){liste.push({beskrivelse:besk,typeId:a.typeId,typenavn:a.typenavn,endringstype:"tilgang",verdierFoer:{},verdierNaa:a.verdier,diff:lagDiff(a.verdier,{}),vegkategorier:alleVK});nT++;}
   for(const [besk,b] of mapB) if(!mapA.has(besk)){liste.push({beskrivelse:besk,typeId:b.typeId,typenavn:b.typenavn,endringstype:"avgang",verdierFoer:b.verdier,verdierNaa:{},diff:lagDiff({},b.verdier),vegkategorier:alleVK});nA++;}
   for(const [besk,a] of mapA){const b=mapB.get(besk);if(!b)continue;const diff=lagDiff(a.verdier,b.verdier);if(!harDiff(diff))continue;liste.push({beskrivelse:besk,typeId:a.typeId,typenavn:a.typenavn,endringstype:"endret",verdierFoer:b.verdier,verdierNaa:a.verdier,diff,vegkategorier:alleVK});nE++;}
-  const netto=e=>{for(const t of["lengde","areal","antall"]){let s=0,h=false;for(const vk of Object.values(e.diff??{})){if(vk[t]!=null){s+=vk[t];h=true;}}if(h)return Math.abs(s);}return 0;};
+  const netto=e=>{for(const t of["lengde","areal","antall"]){let s=0,h=false;for(const vk of Object.values(e.diff??{})){if(vk[t]!=null&&Math.abs(vk[t])>0.001){s+=vk[t];h=true;}}if(h)return Math.abs(s);}return 0;};
   liste.sort((a,b)=>netto(b)-netto(a));
   return {oppsummering:{totaltTilgang:nT,totaltAvgang:nA,totaltEndret:nE},endringsliste:liste,vegkategorier:alleVK};
 }
@@ -388,6 +392,16 @@ function lastNed(innhold,filnavn,mime){
 function primærVerdi(e,side,aktiveVK=null){
   const verdier=side==="foer"?e.verdierFoer:side==="naa"?e.verdierNaa:null;
   const vkListe=aktiveVK&&aktiveVK.length>0 ? aktiveVK : (e.vegkategorier||[]);
+  for(const t of["lengde","areal","antall"]){
+    let s=0,h=false,harVerdi=false;
+    for(const vk of vkListe){
+      const v=side==="diff"?e.diff?.[vk]?.[t]:verdier?.[vk]?.[t];
+      if(v!=null){s+=v;h=true;if(Math.abs(v)>0.001) harVerdi=true;}
+    }
+    // Hopp over typen hvis alle verdier er 0 — prøv neste type (f.eks. antall)
+    if(h && (harVerdi || side==="diff")) return {sum:Math.round(s*100)/100,type:t};
+  }
+  // Fallback: returner første type med noen registrerte verdier, selv om sum er 0
   for(const t of["lengde","areal","antall"]){
     let s=0,h=false;
     for(const vk of vkListe){
@@ -885,6 +899,7 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
   const [apneRad,setApneRad]=useState(null);
   const [valgte,setValgte]=useState(new Set());
   const [konfetti,setKonfetti]=useState(true);
+  const [minPst,setMinPst]=useState(false); // ≥5% filter
   const dato=new Date().toISOString().slice(0,10);
 
   useEffect(()=>{const t=setTimeout(()=>setKonfetti(false),3500);return()=>clearTimeout(t);},[]);
@@ -953,7 +968,15 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
   }
 
   // Sorter filtrert synkende på absolutt prosentendring
-  const filtrertSortert=[...filtrert].sort((a,b)=>{
+  const filtrertSortert=[...filtrert]
+    .filter(e=>{
+      if(!minPst) return true;
+      // Ny/fjernet alltid med når minPst er på (ingen grunnlag å beregne %)
+      if(e.endringstype!=="endret") return true;
+      const pst=beregnPst(e);
+      return pst===null || Math.abs(pst)>=5;
+    })
+    .sort((a,b)=>{
     const pa=beregnPst(a), pb=beregnPst(b);
     const absA=pa!=null?Math.abs(pa):Math.abs(primærVerdi(a,"diff",aktiveVK)?.sum??0);
     const absB=pb!=null?Math.abs(pb):Math.abs(primærVerdi(b,"diff",aktiveVK)?.sum??0);
@@ -1066,6 +1089,25 @@ function Resultater({data,grunnlag,navaerende,onNy}) {
                   {l}
                 </button>
               ))}
+
+              {/* ≥5% toggle */}
+              <div style={{marginLeft:"0.3rem",paddingLeft:"0.7rem",borderLeft:`1.5px solid ${BORD}`}}>
+                <button
+                  onClick={()=>setMinPst(p=>!p)}
+                  style={{
+                    display:"flex",alignItems:"center",gap:"0.45rem",
+                    background:minPst?AMB:"#f4f2ff",
+                    color:minPst?"#fff":SUB,
+                    border:`1.5px solid ${minPst?AMB:BORD}`,
+                    borderRadius:30,padding:"5px 13px",
+                    fontFamily:FB,fontSize:"0.75rem",fontWeight:minPst?700:500,
+                    cursor:"pointer",transition:"all 0.15s",
+                    boxShadow:minPst?`0 2px 8px ${AMB}44`:"none",
+                  }}>
+                  <span style={{fontSize:"0.85rem"}}>📊</span>
+                  {minPst?"✓ ≥5% endring":"≥5% endring"}
+                </button>
+              </div>
             </div>
             <div style={{fontFamily:FB,fontSize:"0.72rem",color:MUTED}}>
               💡 Klikk en rad for detaljer
