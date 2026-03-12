@@ -301,9 +301,10 @@ function parseV2Xlsx(buffer) {
   if (!arknavn) throw new Error("Finner ikke V2-arket i filen.");
   const ws = wb.Sheets[arknavn];
   const alle = XLSX.utils.sheet_to_json(ws, { header:1, defval:null });
-  if (alle.length < 9) throw new Error("Filen har for få rader.");
+  if (alle.length < 8) throw new Error("Filen har for få rader.");
   const meta = {};
-  for (let i=0;i<7;i++) {
+  let headerIdx = -1;
+  for (let i=0;i<Math.min(alle.length,15);i++) {
     const c=(alle[i]||[]).find(v=>v!=null); if(!c) continue; const s=String(c);
     if (s.startsWith("Område:")) meta.omrade=s.replace("Område:","").trim();
     if (s.startsWith("Gyldighetsdato:")) {
@@ -311,8 +312,11 @@ function parseV2Xlsx(buffer) {
       if(m1) meta.gyldighetsdato=m1[1].trim(); if(m2) meta.utskriftsdato=m2[1].trim();
     }
     if (s.startsWith("Rapporttype:")) meta.rapporttype=s.replace("Rapporttype:","").trim();
+    // Finn header-raden dynamisk
+    if (s==="Beskrivelse") headerIdx=i;
   }
-  const headers=(alle[7]||[]).map(h=>h!=null?String(h).trim():null);
+  if (headerIdx===-1) throw new Error("Finner ikke header-rad med 'Beskrivelse' i filen.");
+  const headers=(alle[headerIdx]||[]).map(h=>h!=null?String(h).trim():null);
   const kolDef=[];
   for(let i=3;i<headers.length;i++){
     const h=headers[i]; if(!h) continue;
@@ -321,7 +325,7 @@ function parseV2Xlsx(buffer) {
   }
   const vegkategorier=[...new Set(kolDef.map(k=>k.vegkat))];
   const rader=[];
-  for(let ri=8;ri<alle.length;ri++){
+  for(let ri=headerIdx+1;ri<alle.length;ri++){
     const r=alle[ri]; if(!r) continue;
     const besk=r[0]!=null?String(r[0]).trim():null;
     const typeId=r[1]!=null?String(r[1]).trim():null;
